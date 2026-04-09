@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 import shap
 import streamlit as st
-from typing import Any
 import __main__
 from textblob import TextBlob
 
@@ -23,6 +23,7 @@ NUMERIC_FIELDS = [
     "previous_failures",
 ]
 TEXT_FIELD = "feedback_text"
+NAME_FIELD = "student_name"
 SENTIMENT_FEATURE = "feedback_sentiment_polarity"
 
 
@@ -31,14 +32,14 @@ def apply_custom_theme() -> None:
         """
         <style>
             .stApp {
-                background: linear-gradient(135deg, #f8fafc 0%, #eef2ff 35%, #f8fafc 100%);
+                background: linear-gradient(125deg, #f6fbff 0%, #eef8f3 40%, #f7fbff 100%);
             }
             .main .block-container {
                 padding-top: 1.5rem;
                 max-width: 1150px;
             }
             .hero-box {
-                background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 55%, #2563eb 100%);
+                background: linear-gradient(135deg, #0f172a 0%, #124a44 55%, #1f7a8c 100%);
                 border-radius: 18px;
                 padding: 1.5rem 1.6rem;
                 color: #ffffff;
@@ -156,35 +157,76 @@ def format_feature_name(raw_name: str) -> str:
 def top_contributing_features(model_pipeline, input_df: pd.DataFrame, top_n: int = 5) -> list[dict]:
     """Return top-N SHAP feature contributions for a single prediction record."""
     preprocessor = model_pipeline.named_steps["preprocessor"]
-    explainer = load_shap_explainer(model_pipeline)
-
-    # Convert sparse output to dense for SHAP compatibility.
     transformed = preprocessor.transform(input_df)
     transformed_dense = transformed.toarray() if hasattr(transformed, "toarray") else np.asarray(transformed)
-
-    # Use modern SHAP call pattern for forward compatibility.
-    shap_output = explainer(transformed_dense)
-    shap_values = getattr(shap_output, "values", shap_output)
-
-    if isinstance(shap_values, list):
-        shap_array = np.asarray(shap_values[1]) if len(shap_values) > 1 else np.asarray(shap_values[0])
-    else:
-        shap_array = np.asarray(shap_values)
-    contribution_scores = shap_array[0]
-
     feature_names = preprocessor.get_feature_names_out()
+
+    try:
+        explainer = load_shap_explainer(model_pipeline)
+
+        # Use modern SHAP call pattern for forward compatibility.
+        shap_output = explainer(transformed_dense)
+        shap_values = getattr(shap_output, "values", shap_output)
+
+        if isinstance(shap_values, list):
+            shap_array = np.asarray(shap_values[1]) if len(shap_values) > 1 else np.asarray(shap_values[0])
+        else:
+            shap_array = np.asarray(shap_values)
+        contribution_scores = shap_array[0]
+    except Exception:
+        # Fallback approximation if SHAP fails in constrained runtimes.
+        classifier = model_pipeline.named_steps["classifier"]
+        importances = getattr(classifier, "feature_importances_", np.zeros(len(feature_names)))
+        contribution_scores = transformed_dense[0] * importances
+
     top_indices = np.argsort(np.abs(contribution_scores))[::-1][:top_n]
 
     features = []
     for idx in top_indices:
+        score = float(contribution_scores[idx])
         features.append(
             {
                 "feature": format_feature_name(feature_names[idx]),
-                "contribution": float(contribution_scores[idx]),
-                "impact": "increases_risk" if contribution_scores[idx] > 0 else "reduces_risk",
+                "contribution": score,
+                "impact": "increases_risk" if score > 0 else "reduces_risk",
             }
         )
     return features
+
+
+def summarize_explanation(contributions: list[dict]) -> str:
+    """Create a plain-language explanation from top feature contributions."""
+    readable = {
+        "attendance_percent": "lower attendance",
+        "avg_grade": "lower average grade",
+        "assignments_submitted": "fewer assignments submitted",
+        "previous_failures": "previous failures",
+        "feedback_sentiment_polarity": "negative feedback sentiment",
+    }
+
+    increasing = [item for item in contributions if item["impact"] == "increases_risk"]
+    if not increasing:
+        return "Your strongest factors currently reduce disengagement risk."
+
+    top_factors = []
+    for item in increasing[:2]:
+        raw = item["feature"]
+        if raw.startswith("feedback:"):
+            top_factors.append("phrases in your written feedback")
+        else:
+            top_factors.append(readable.get(raw, raw.replace("_", " ")))
+
+    if len(top_factors) == 1:
+        return f"The model found that {top_factors[0]} contributed most to higher risk."
+    return f"The model found that {top_factors[0]} and {top_factors[1]} contributed most to higher risk."
+
+
+def motivational_tip(category: str) -> str:
+    if category == "Low":
+        return "Great momentum. Keep attendance and assignment consistency strong."
+    if category == "Medium":
+        return "You are close to low risk. Improving weekly attendance and assignment completion can help quickly."
+    return "You can turn this around. Start with small steps this week: attend every class and submit at least one pending assignment."
 
 
 def build_input_frame(
@@ -213,6 +255,10 @@ def build_input_frame(
 
 def _validate_single_input(payload: dict[str, Any]) -> tuple[bool, str | None]:
     """Validate and sanitize a single prediction payload."""
+    student_name = str(payload.get(NAME_FIELD, "")).strip()
+    if not student_name:
+        return False, "student_name is required"
+
     checks = {
         "attendance_percent": (0, 100),
         "avg_grade": (0, 100),
@@ -238,10 +284,13 @@ def _validate_single_input(payload: dict[str, Any]) -> tuple[bool, str | None]:
 
 def validate_batch_dataframe(dataframe: pd.DataFrame) -> tuple[bool, str | None]:
     """Validate uploaded batch data before model inference."""
-    required_columns = NUMERIC_FIELDS + [TEXT_FIELD]
+    required_columns = [NAME_FIELD] + NUMERIC_FIELDS + [TEXT_FIELD]
     missing = [column for column in required_columns if column not in dataframe.columns]
     if missing:
         return False, f"Missing required columns: {', '.join(missing)}"
+
+    if dataframe[NAME_FIELD].astype(str).str.strip().eq("").any():
+        return False, "student_name must be non-empty for all rows"
 
     checks = {
         "attendance_percent": (0, 100),
@@ -267,12 +316,14 @@ def validate_batch_dataframe(dataframe: pd.DataFrame) -> tuple[bool, str | None]
 
 
 def render_single_prediction(model_pipeline) -> None:
-    """Render the single-student prediction workflow."""
+    """Render the student-facing personal risk workflow."""
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.subheader("Single Student Prediction")
-    st.caption("Use sliders and feedback text to estimate disengagement risk in real time.")
+    st.subheader("Student Check-In")
+    st.caption("Track your engagement level and get simple, supportive guidance.")
 
     with st.form("single_prediction_form", clear_on_submit=False):
+        student_name = st.text_input("Your Name", value="")
+
         col1, col2 = st.columns(2)
         with col1:
             attendance_percent = st.slider("Attendance Percent", min_value=0.0, max_value=100.0, value=75.0, step=1.0)
@@ -291,6 +342,7 @@ def render_single_prediction(model_pipeline) -> None:
 
     if submitted:
         payload = {
+            NAME_FIELD: student_name,
             "attendance_percent": attendance_percent,
             "avg_grade": avg_grade,
             "assignments_submitted": assignments_submitted,
@@ -314,11 +366,13 @@ def render_single_prediction(model_pipeline) -> None:
         risk_score = float(model_pipeline.predict_proba(input_df)[0, 1])
         category = risk_category(risk_score)
         contributions = top_contributing_features(model_pipeline, input_df, top_n=5)
+        explanation = summarize_explanation(contributions)
 
         metrics_col1, metrics_col2 = st.columns([1, 1])
         with metrics_col1:
-            st.metric("Risk Score", f"{risk_score:.4f}")
-            st.markdown("<p class='small-note'>Probability from XGBoost classifier</p>", unsafe_allow_html=True)
+            st.metric("Risk Score", f"{risk_score:.2f}")
+            st.progress(min(max(risk_score, 0.0), 1.0), text=f"{risk_score * 100:.1f}% disengagement probability")
+            st.markdown("<p class='small-note'>This is a probability score from 0 to 1.</p>", unsafe_allow_html=True)
         with metrics_col2:
             indicator_color = risk_color(category)
             st.markdown(
@@ -331,68 +385,185 @@ def render_single_prediction(model_pipeline) -> None:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("### Top 5 Contributing Features")
-        chart_df = pd.DataFrame(contributions)
-        chart_df["abs_contribution"] = chart_df["contribution"].abs()
-        chart_plot_df = chart_df[["feature", "abs_contribution"]].set_index("feature")
-        st.bar_chart(chart_plot_df, use_container_width=True)
-        st.dataframe(chart_df[["feature", "contribution", "impact"]], use_container_width=True)
+        st.markdown(f"### Hello {student_name}, here is your result")
+        st.info(explanation)
+        st.success(motivational_tip(category))
+
+        contribution_df = pd.DataFrame(contributions)
+        contribution_df["abs_contribution"] = contribution_df["contribution"].abs()
+        st.markdown("#### What influenced this prediction")
+        st.bar_chart(contribution_df[["feature", "abs_contribution"]].set_index("feature"), use_container_width=True)
+        st.dataframe(contribution_df[["feature", "contribution", "impact"]], use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_batch_prediction(model_pipeline) -> None:
-    """Render the batch CSV prediction workflow."""
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.subheader("Batch CSV Prediction")
-    st.caption(
-        "Upload a CSV with: attendance_percent, avg_grade, assignments_submitted, previous_failures, feedback_text (optional: student_id)."
-    )
+def _sample_student_table() -> pd.DataFrame:
+    """Return a preview-ready student table from local dataset or defaults."""
+    dataset_path = ROOT_DIR / "data" / "multimodal_student_data.csv"
+    if dataset_path.exists():
+        data = pd.read_csv(dataset_path).copy()
+        required = NUMERIC_FIELDS + [TEXT_FIELD]
+        available = [column for column in required if column in data.columns]
+        table = data[available].head(30).copy()
+    else:
+        table = pd.DataFrame(
+            [
+                {
+                    "attendance_percent": 84,
+                    "avg_grade": 76,
+                    "assignments_submitted": 8,
+                    "previous_failures": 0,
+                    "feedback_text": "I feel positive and keep up with coursework.",
+                },
+                {
+                    "attendance_percent": 58,
+                    "avg_grade": 49,
+                    "assignments_submitted": 4,
+                    "previous_failures": 2,
+                    "feedback_text": "I miss classes and struggle to complete assignments.",
+                },
+            ]
+        )
 
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    if uploaded is None:
-        return
+    if NAME_FIELD not in table.columns:
+        table.insert(0, NAME_FIELD, [f"Student_{idx+1:02d}" for idx in range(len(table))])
 
-    try:
-        df = pd.read_csv(uploaded)
-    except Exception:
-        st.error("Unable to parse CSV file.")
-        return
+    ordered_cols = [NAME_FIELD] + [col for col in NUMERIC_FIELDS + [TEXT_FIELD] if col in table.columns]
+    return table[ordered_cols]
 
-    ok, message = validate_batch_dataframe(df)
-    if not ok:
-        st.error(message)
-        return
 
+def _predict_batch(model_pipeline, dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run predictions and gather per-row SHAP contribution summaries."""
     rows = []
-    with st.spinner("Generating predictions..."):
-        for index, row in df.iterrows():
-            input_df = build_input_frame(
-                row["attendance_percent"],
-                row["avg_grade"],
-                row["assignments_submitted"],
-                row["previous_failures"],
-                row["feedback_text"],
-            )
-            score = float(model_pipeline.predict_proba(input_df)[0, 1])
-            category = risk_category(score)
-            features = top_contributing_features(model_pipeline, input_df, top_n=5)
+    importance_rows = []
 
-            feature_summary = "; ".join(
-                [f"{item['feature']} ({item['contribution']:.3f})" for item in features[:3]]
+    for index, row in dataframe.iterrows():
+        input_df = build_input_frame(
+            row["attendance_percent"],
+            row["avg_grade"],
+            row["assignments_submitted"],
+            row["previous_failures"],
+            row["feedback_text"],
+        )
+        score = float(model_pipeline.predict_proba(input_df)[0, 1])
+        category = risk_category(score)
+        contributions = top_contributing_features(model_pipeline, input_df, top_n=5)
+        explanation = summarize_explanation(contributions)
+
+        for item in contributions:
+            importance_rows.append(
+                {
+                    "student_name": str(row[NAME_FIELD]),
+                    "feature": item["feature"],
+                    "contribution": item["contribution"],
+                    "abs_contribution": abs(item["contribution"]),
+                }
             )
-            row_result = {
+
+        rows.append(
+            {
                 "row_number": int(index + 1),
-                "student_id": str(row["student_id"]) if "student_id" in df.columns else "-",
+                "student_name": str(row[NAME_FIELD]),
                 "risk_score": round(score, 4),
                 "risk_category": category,
-                "top_features": feature_summary,
+                "risk_color": risk_color(category),
+                "explanation": explanation,
             }
-            rows.append(row_result)
+        )
 
-    result_df = pd.DataFrame(rows)
-    st.success(f"Processed {len(result_df)} records")
-    st.dataframe(result_df, use_container_width=True)
+    return pd.DataFrame(rows), pd.DataFrame(importance_rows)
+
+
+def _style_risk_cells(value: str) -> str:
+    color_map = {
+        "Low": "background-color: #dcfce7; color: #14532d; font-weight: 700",
+        "Medium": "background-color: #ffedd5; color: #9a3412; font-weight: 700",
+        "High": "background-color: #fee2e2; color: #991b1b; font-weight: 700",
+    }
+    return color_map.get(value, "")
+
+
+def render_teacher_dashboard(model_pipeline) -> None:
+    """Render the teacher-facing batch dashboard and exports."""
+    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+    st.subheader("Teacher Dashboard")
+    st.caption(
+        "Analyze all students from CSV upload or local list, with risk categories and SHAP-based explanations."
+    )
+
+    source = st.radio(
+        "Student source",
+        options=["Upload CSV", "Use local student list"],
+        horizontal=True,
+    )
+
+    batch_df = None
+    if source == "Upload CSV":
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+        if uploaded is not None:
+            try:
+                batch_df = pd.read_csv(uploaded)
+            except Exception:
+                st.error("Unable to parse CSV file.")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
+    else:
+        batch_df = _sample_student_table()
+
+    if batch_df is None:
+        st.info(
+            "CSV must include columns: student_name, attendance_percent, avg_grade, assignments_submitted, previous_failures, feedback_text"
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    st.markdown("#### Student List Preview")
+    st.dataframe(batch_df.head(20), use_container_width=True)
+
+    ok, message = validate_batch_dataframe(batch_df)
+    if not ok:
+        st.error(message)
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    run_predictions = st.button("Run Batch Predictions", type="primary", use_container_width=True)
+    if not run_predictions:
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    with st.spinner("Generating predictions..."):
+        result_df, importance_df = _predict_batch(model_pipeline, batch_df)
+
+    st.success(f"Processed {len(result_df)} students")
+
+    total_students = len(result_df)
+    high_risk_count = int((result_df["risk_category"] == "High").sum())
+    avg_risk = float(result_df["risk_score"].mean()) if total_students else 0.0
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    metric_col1.metric("Students", total_students)
+    metric_col2.metric("High Risk", high_risk_count)
+    metric_col3.metric("Average Risk Score", f"{avg_risk:.3f}")
+
+    st.markdown("#### Risk Distribution")
+    category_counts = result_df["risk_category"].value_counts().reindex(["Low", "Medium", "High"], fill_value=0)
+    st.bar_chart(category_counts)
+
+    st.markdown("#### SHAP Feature Importance (Batch Aggregate)")
+    if not importance_df.empty:
+        feature_importance = (
+            importance_df.groupby("feature", as_index=False)["abs_contribution"].mean().sort_values(
+                by="abs_contribution", ascending=False
+            )
+        )
+        st.bar_chart(feature_importance.head(10).set_index("feature"))
+
+    st.markdown("#### Student Risk Table")
+    styled_df = result_df[["student_name", "risk_score", "risk_category", "risk_color", "explanation"]].style.map(
+        _style_risk_cells, subset=["risk_category"]
+    )
+    st.dataframe(styled_df, use_container_width=True)
 
     st.download_button(
         label="Download predictions CSV",
@@ -416,7 +587,7 @@ def main() -> None:
         """
         <div class='hero-box'>
             <div class='hero-title'>AI-Based Student Disengagement Detection System</div>
-            <p class='hero-subtitle'>Predict risk with multimodal intelligence: academic behavior + NLP sentiment + SHAP explainability.</p>
+            <p class='hero-subtitle'>Separate student and teacher experiences with multimodal prediction and explainable insights.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -430,11 +601,11 @@ def main() -> None:
 
     model_pipeline = bundle["model"]
 
-    tab_single, tab_batch = st.tabs(["Single Prediction", "Batch CSV"])
+    tab_single, tab_batch = st.tabs(["Student Interface", "Teacher Interface"])
     with tab_single:
         render_single_prediction(model_pipeline)
     with tab_batch:
-        render_batch_prediction(model_pipeline)
+        render_teacher_dashboard(model_pipeline)
 
     st.caption("Built with Streamlit, XGBoost, TF-IDF, TextBlob, and SHAP")
 

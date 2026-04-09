@@ -1,0 +1,4 @@
+row_number,student_name,risk_score,risk_category,risk_color,explanation
+1,Asha,0.0229,Low,green,The model found that phrases in your written feedback contributed most to higher risk.
+2,Ravi,0.9967,High,red,The model found that phrases in your written feedback and lower attendance contributed most to higher risk.
+3,Meena,0.9502,High,red,The model found that phrases in your written feedback and previous failures contributed most to higher risk.

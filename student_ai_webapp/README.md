@@ -16,19 +16,52 @@ student_ai_webapp/
 └── README.md
 ```
 
-## Inputs
+## Interfaces
 
-- attendance_percent (0-100)
-- avg_grade (0-100)
-- assignments_submitted (0-10)
-- previous_failures (0-5)
+### Student Interface
+
+- Enter personal details and written feedback:
+	- student_name
+	- attendance_percent (0-100)
+	- avg_grade (0-100)
+	- assignments_submitted (0-10)
+	- previous_failures (0-5)
+	- feedback_text
+- View:
+	- Personal risk score
+	- Risk category (Low / Medium / High)
+	- Simple explanation of top risk drivers
+	- Motivational improvement tip
+
+### Teacher Interface
+
+- Use either:
+	- CSV upload, or
+	- local student list preview
+- Run batch predictions for all rows.
+- View dashboard outputs:
+	- Risk score and risk category per student
+	- SHAP-based feature importance (batch aggregate)
+	- Color-coded risk indicators
+- Download full prediction results as CSV.
+
+## Input Schema (Batch CSV)
+
+Required columns:
+
+- student_name
+- attendance_percent
+- avg_grade
+- assignments_submitted
+- previous_failures
 - feedback_text
 
 ## Outputs
 
 - risk_score (0-1)
 - risk_category (Low / Medium / High)
-- top 5 contributing features (SHAP)
+- explanation text (from SHAP top contributors)
+- top contributing features (SHAP)
 
 ## Setup
 
@@ -57,6 +90,14 @@ Data handling behavior:
 ```bash
 streamlit run app.py
 ```
+
+4. Run desktop app (non-Streamlit, native window on Windows):
+
+```bash
+python desktop_app.py
+```
+
+This launches a desktop application with Student and Teacher interfaces.
 
 ## Deployment
 
